@@ -1,5 +1,10 @@
 # GregTech6CE/.github
 
-`GregTech6CE` 组织级公共仓库，存放社区健康文件与跨仓库复用的 GitHub Actions 工作流。
+`GregTech6CE` 组织级公共配置与跨仓库可复用工作流仓库。
 
-本仓库当前只有这份基线说明；可复用工作流与调用模板在后续改动中加入，届时本文件同步更新为目录与用法说明。
+## 内容索引
+
+| 路径 | 说明 |
+| --- | --- |
+| `.github/workflows/project-sync-reusable.yml` | 组织 Project 状态同步可复用工作流 |
+| `templates/workflows/project-sync.yml` | 业务仓库接入模板 |

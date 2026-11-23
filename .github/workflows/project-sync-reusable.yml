@@ -1,0 +1,362 @@
+name: project-sync
+
+# 组织级 Project 状态同步的可复用工作流。
+#
+# 只以 workflow_call 暴露：事件与 secret 都由调用方提供，本文件不监听任何事件。
+# "谁有权触发"因此留在业务仓的 workflow 定义里，本仓库只维护状态判定。
+#
+# 安全约束（改动时逐条保持）：
+# - 不 checkout：PR 事件不执行任何仓库代码，也不写工作区；
+# - 事件上下文只在 actions/github-script 内以 context.payload 读取，不进入 shell；
+# - 唯一凭据是 PROJECT_SYNC_TOKEN，由组织 secret 白名单下发或调用方仓库 Secret 提供；
+# - Project/字段/选项 ID 全部运行时由 GraphQL 解析，不硬编码。
+on:
+  workflow_call:
+    inputs:
+      project_number:
+        description: 组织 Project 的编号（Projects 页面 URL 末尾的数字）
+        required: false
+        type: number
+        default: 1
+      org:
+        description: Project 所属组织
+        required: false
+        type: string
+        default: GregTech6CE
+    secrets:
+      PROJECT_SYNC_TOKEN:
+        description: 具备组织 Project 读写权限的 token
+        required: true
+
+# 不依赖 GITHUB_TOKEN：所有读写都走 PROJECT_SYNC_TOKEN。
+permissions: {}
+
+# 同一 issue / PR 的并发事件按到达顺序处理，避免旧事件覆盖新状态。
+concurrency:
+  group: project-sync-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # 凭据只在步骤级 env 出现，不进入 job 级或顶层 env。
+    steps:
+      # 空 secret 在 github-script 里表现为 401，信息不足；先给出可操作的报错。
+      - name: 校验 PROJECT_SYNC_TOKEN
+        env:
+          PROJECT_SYNC_TOKEN: ${{ secrets.PROJECT_SYNC_TOKEN }}
+        run: |
+          if [ -z "${PROJECT_SYNC_TOKEN:-}" ]; then
+            echo "::error::PROJECT_SYNC_TOKEN 为空。请检查组织 secret 白名单是否向该仓库下发了 PROJECT_SYNC_TOKEN，或业务仓是否配置了同名 Secret；不要改用 secrets: inherit。"
+            exit 1
+          fi
+
+      - name: 同步 Status
+        uses: actions/github-script@v7
+        env:
+          PROJECT_SYNC_TOKEN: ${{ secrets.PROJECT_SYNC_TOKEN }}
+          PROJECT_NUMBER: ${{ inputs.project_number }}
+          PROJECT_ORG: ${{ inputs.org }}
+        with:
+          github-token: ${{ secrets.PROJECT_SYNC_TOKEN }}
+          script: |
+            const TRIAGE_LABEL = 'needs triage'
+            const STATUS = {
+              TRIAGE: 'Triage',
+              READY: 'Ready',
+              IN_PROGRESS: 'In Progress',
+              IN_REVIEW: 'In Review',
+              DONE: 'Done',
+            }
+            const STATUS_NAMES = [STATUS.TRIAGE, STATUS.READY, STATUS.IN_PROGRESS, STATUS.IN_REVIEW, STATUS.DONE]
+            const REVIEW_ACTIONS = ['opened', 'reopened', 'ready_for_review', 'review_requested']
+
+            const Q_PROJECT = `
+            query ProjectContext($org: String!, $number: Int!) {
+              organization(login: $org) {
+                projectV2(number: $number) {
+                  id
+                  title
+                  field(name: "Status") {
+                    __typename
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      options {
+                        id
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }`
+
+            const Q_ITEM_STATUS = `
+            query ItemStatus($itemId: ID!) {
+              node(id: $itemId) {
+                ... on ProjectV2Item {
+                  fieldValueByName(name: "Status") {
+                    __typename
+                    ... on ProjectV2ItemFieldSingleSelectValue {
+                      name
+                    }
+                  }
+                }
+              }
+            }`
+
+            const Q_CONTENT_ID = `
+            query ContentId($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                issueOrPullRequest(number: $number) {
+                  ... on Issue {
+                    id
+                  }
+                  ... on PullRequest {
+                    id
+                  }
+                }
+              }
+            }`
+
+            const Q_ITEM_OF_CONTENT = `
+            query ItemOfContent($id: ID!) {
+              node(id: $id) {
+                ... on Issue {
+                  projectItems(first: 50) {
+                    nodes {
+                      id
+                      project {
+                        id
+                      }
+                    }
+                  }
+                }
+                ... on PullRequest {
+                  projectItems(first: 50) {
+                    nodes {
+                      id
+                      project {
+                        id
+                      }
+                    }
+                  }
+                }
+              }
+            }`
+
+            const Q_LINKED_ISSUES = `
+            query LinkedIssues($id: ID!) {
+              node(id: $id) {
+                ... on PullRequest {
+                  closingIssuesReferences(first: 50) {
+                    nodes {
+                      id
+                      number
+                      state
+                    }
+                  }
+                }
+              }
+            }`
+
+            const M_ADD_ITEM = `
+            mutation AddItem($projectId: ID!, $contentId: ID!) {
+              addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                item {
+                  id
+                }
+              }
+            }`
+
+            const M_SET_STATUS = `
+            mutation SetStatus($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+              updateProjectV2ItemFieldValue(
+                input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { singleSelectOptionId: $optionId } }
+              ) {
+                projectV2Item {
+                  id
+                }
+              }
+            }`
+
+            const token = (process.env.PROJECT_SYNC_TOKEN || '').trim()
+            if (!token) {
+              core.setFailed('PROJECT_SYNC_TOKEN 为空：请检查组织 secret 白名单，或调用方仓库是否配置了同名 Secret。')
+              return
+            }
+
+            const org = (process.env.PROJECT_ORG || '').trim()
+            if (!org) {
+              core.setFailed('输入 org 为空：调用方未传值，本工作流 default 也缺失。')
+              return
+            }
+
+            const projectNumber = Number(process.env.PROJECT_NUMBER)
+            if (!Number.isInteger(projectNumber) || projectNumber <= 0) {
+              core.setFailed(`输入 project_number 非法：${process.env.PROJECT_NUMBER}。应为正整数。`)
+              return
+            }
+
+            const eventName = context.eventName
+            const action = context.payload.action
+            const isIssueEvent = eventName === 'issues'
+            const isPullEvent = eventName === 'pull_request_target' || eventName === 'pull_request_review'
+            if (!isIssueEvent && !isPullEvent) {
+              core.info(`事件 ${eventName} 不在同步范围，跳过。`)
+              return
+            }
+
+            async function gql(query, variables) {
+              try {
+                return await github.graphql(query, variables)
+              } catch (error) {
+                const detail = Array.isArray(error?.errors) && error.errors.length > 0
+                  ? error.errors.map((item) => item.message).join('; ')
+                  : error.message
+                throw new Error(`GraphQL 请求失败：${detail}`)
+              }
+            }
+
+            function decideIssue(issue) {
+              // 无关标签的增减不改变 Status，否则会把 In Progress / In Review 覆盖成 Triage 或 Ready。
+              if ((action === 'labeled' || action === 'unlabeled') && context.payload.label?.name !== TRIAGE_LABEL) {
+                return { skip: `标签变更 "${context.payload.label?.name ?? '未知'}" 与 ${TRIAGE_LABEL} 无关` }
+              }
+              if (issue.state === 'closed') {
+                return { status: STATUS.DONE, reason: 'issue 已关闭' }
+              }
+              const labels = (issue.labels || []).map((label) => (typeof label === 'string' ? label : label.name))
+              if (labels.includes(TRIAGE_LABEL)) {
+                return { status: STATUS.TRIAGE, reason: `仍带 ${TRIAGE_LABEL} 标签` }
+              }
+              if ((issue.assignees || []).length > 0) {
+                return { status: STATUS.IN_PROGRESS, reason: `有 ${issue.assignees.length} 个 assignee` }
+              }
+              return { status: STATUS.READY, reason: '未关闭、无 needs triage、无 assignee' }
+            }
+
+            function decidePullRequest(pull) {
+              if (pull.state === 'closed') {
+                return { status: STATUS.DONE, reason: pull.merged === true || pull.merged_at ? 'PR 已合并' : 'PR 已关闭' }
+              }
+              if (eventName === 'pull_request_review' && context.payload.review?.state === 'changes_requested') {
+                return { status: STATUS.IN_PROGRESS, reason: 'review 要求修改' }
+              }
+              if (pull.draft === true) {
+                return { status: STATUS.IN_PROGRESS, reason: 'PR 处于 draft' }
+              }
+              if (pull.draft === false && REVIEW_ACTIONS.includes(action)) {
+                return { status: STATUS.IN_REVIEW, reason: `PR 就绪（${action}）` }
+              }
+              return { skip: `事件 ${eventName}/${action} 不改变 Status` }
+            }
+
+            const subject = isIssueEvent ? context.payload.issue : context.payload.pull_request
+            if (!subject || typeof subject.number !== 'number') {
+              core.setFailed(`事件 ${eventName} 缺少 issue / pull_request 主体，无法定位 Project item。`)
+              return
+            }
+
+            const kind = isIssueEvent ? 'issue' : 'PR'
+            const decision = isIssueEvent ? decideIssue(subject) : decidePullRequest(subject)
+            if (decision.skip) {
+              core.info(`${kind} #${subject.number} 跳过：${decision.skip}。`)
+              return
+            }
+            core.info(`事件 ${eventName}/${action}：${kind} #${subject.number} 目标 ${decision.status}（${decision.reason}）。`)
+
+            try {
+              const projectData = await gql(Q_PROJECT, { org, number: projectNumber })
+              const project = projectData.organization?.projectV2
+              if (!project) {
+                core.setFailed(`未找到组织 ${org} 的 Project #${projectNumber}，请核对 project_number 与 token 的 Projects 权限。`)
+                return
+              }
+              const statusField = project.field
+              if (!statusField || statusField.__typename !== 'ProjectV2SingleSelectField') {
+                core.setFailed(`Project #${projectNumber} 的 Status 不是单选字段（实际：${statusField?.__typename ?? '缺失'}）。`)
+                return
+              }
+              const optionIds = new Map(statusField.options.map((option) => [option.name, option.id]))
+              const missing = STATUS_NAMES.filter((name) => !optionIds.has(name))
+              if (missing.length > 0) {
+                core.setFailed(`Status 缺少选项：${missing.join('、')}。现有选项：${[...optionIds.keys()].join('、')}。`)
+                return
+              }
+              core.info(`Project #${projectNumber}「${project.title}」：Status 字段 ${statusField.id}，5 个选项齐全。`)
+
+              async function contentIdOf(number) {
+                const data = await gql(Q_CONTENT_ID, { owner: context.repo.owner, name: context.repo.repo, number })
+                const id = data.repository?.issueOrPullRequest?.id
+                if (!id) throw new Error(`无法解析 #${number} 的节点 ID`)
+                return id
+              }
+
+              // addProjectV2ItemById 对已在 Project 中的对象是幂等的；仍保留一次按归属反查作为兜底。
+              async function itemIdOf(contentId) {
+                try {
+                  const added = await gql(M_ADD_ITEM, { projectId: project.id, contentId })
+                  const id = added.addProjectV2ItemById?.item?.id
+                  if (!id) throw new Error('addProjectV2ItemById 未返回 item.id')
+                  return id
+                } catch (error) {
+                  if (!/already exists|duplicate/i.test(error.message)) throw error
+                  const data = await gql(Q_ITEM_OF_CONTENT, { id: contentId })
+                  const found = (data.node?.projectItems?.nodes || []).find((node) => node.project?.id === project.id)
+                  if (!found) throw error
+                  return found.id
+                }
+              }
+
+              async function syncStatus({ label, target, number, contentId, reason }) {
+                const itemId = await itemIdOf(contentId)
+                const currentData = await gql(Q_ITEM_STATUS, { itemId })
+                const current = currentData.node?.fieldValueByName?.name ?? null
+                if (current === target) {
+                  core.info(`${label} #${number}：已是 ${target}，跳过写入（${reason}）。`)
+                  return { status: target, changed: false }
+                }
+                await gql(M_SET_STATUS, {
+                  projectId: project.id,
+                  itemId,
+                  fieldId: statusField.id,
+                  optionId: optionIds.get(target),
+                })
+                core.info(`${label} #${number}：${current ?? '未设置'} → ${target}（${reason}）。`)
+                return { status: target, changed: true }
+              }
+
+              const subjectContentId = subject.node_id || (await contentIdOf(subject.number))
+              const result = await syncStatus({
+                label: kind,
+                target: decision.status,
+                number: subject.number,
+                contentId: subjectContentId,
+                reason: decision.reason,
+              })
+
+              // 只在这两个状态下连带同步关联 issue：PR 关闭时关联 issue 由自身事件收尾。
+              if (!isIssueEvent && (result.status === STATUS.IN_PROGRESS || result.status === STATUS.IN_REVIEW)) {
+                const linked = await gql(Q_LINKED_ISSUES, { id: subjectContentId })
+                const nodes = linked.node?.closingIssuesReferences?.nodes || []
+                const open = nodes.filter((issue) => issue.state === 'OPEN')
+                if (open.length === 0) {
+                  core.info('没有仍处于 OPEN 的关联 issue，跳过关联同步。')
+                }
+                for (const issue of open) {
+                  await syncStatus({
+                    label: '关联 issue',
+                    target: result.status,
+                    number: issue.number,
+                    contentId: issue.id,
+                    reason: `随 PR #${subject.number} 同步`,
+                  })
+                }
+              }
+
+              core.info(`完成：${kind} #${subject.number} → ${result.status}${result.changed ? '（已写入）' : '（无变化）'}。`)
+            } catch (error) {
+              core.setFailed(error.message)
+            }
