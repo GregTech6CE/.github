@@ -73,6 +73,43 @@ jobs:
             templates
           persist-credentials: false
 
+      # 安装在无 harden-runner 的 fetch 中完成：analysis 的白名单不放行
+      # PyPI / Astral，工具只通过缓存传递。
+      - name: Setup uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.9"
+          enable-cache: false
+      - name: Restore uv toolchain
+        id: uv-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/uv
+            ~/.local/bin
+          key: uv-mistral-vibe-${{ runner.os }}-3.1.4
+      - name: Install mistral-vibe
+        env:
+          CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          # setup-uv 默认把 Python 放进 runner 临时目录；显式落回缓存路径，
+          # 让工具 venv 的 shebang 在 analysis 恢复后仍然有效。
+          export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/uv/python"
+          if [ "${CACHE_HIT:-false}" != "true" ]; then
+            uv tool install --python 3.14 mistral-vibe==3.1.4
+          fi
+          if [ ! -x "$HOME/.local/bin/vibe-acp" ]; then
+            echo "::error::缓存中没有 vibe-acp"
+            exit 1
+          fi
+          installed=$("$HOME/.local/bin/vibe-acp" --version)
+          echo "$installed"
+          case "$installed" in
+            *" 3.1.4") ;;
+            *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
+          esac
+
       # 下载与校验集中在 fetch：下游 analysis 的 harden-runner 不需要为 Release CDN 放宽。
       - name: Download CI bundle
         run: |
@@ -181,38 +218,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      # 安装必须排在 harden-runner 之前：uv 解析依赖与下载 wheel 需要 PyPI / Astral
-      # 出网，而下面的白名单不放行这些域名。缓存只覆盖 uv 的工具、Python 与 shim，
-      # 不放宽运行期边界。
-      - name: Setup uv
-        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
-        with:
-          version: "0.13.9"
-          # 缓存统一由下一步管理，避免与本工作流的 versioned cache key 冲突。
-          enable-cache: false
-      - name: Restore uv toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.local/share/uv
-            ~/.local/bin
-            ~/.cache/uv
-          key: uv-mistral-vibe-${{ runner.os }}-3.1.4
-      - name: Install mistral-vibe
-        run: |
-          set -euo pipefail
-          uv tool install --python 3.14 mistral-vibe==3.1.4
-          # 缓存可能只有工具目录而没有 shim；缺 shim 时强制重建。
-          if [ ! -x "$HOME/.local/bin/vibe-acp" ]; then
-            uv tool install --force --python 3.14 mistral-vibe==3.1.4
-          fi
-          installed=$("$HOME/.local/bin/vibe-acp" --version)
-          echo "$installed"
-          case "$installed" in
-            *3.1.4*) ;;
-            *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
-          esac
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       # 出网白名单：与 deploy/egress-allowlist.txt 对齐。
       # 改这里时同步改那份文件，否则 Docker 侧与 CI 侧的边界会漂移。
       - name: Harden runner (egress allowlist)
@@ -230,6 +235,29 @@ jobs:
             api.mistral.ai:443
             chat.mistral.ai:443
             api.cline.bot:443
+      # 工具由 fetch 安装并写入同一 key；这里只恢复，不再访问 PyPI/Astral。
+      - name: Restore uv toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.local/share/uv
+            ~/.local/bin
+          key: uv-mistral-vibe-${{ runner.os }}-3.1.4
+          fail-on-cache-miss: true
+      - name: Verify vibe-acp
+        run: |
+          set -euo pipefail
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$HOME/.local/bin/vibe-acp" ]; then
+            echo "::error::缓存中没有 vibe-acp"
+            exit 1
+          fi
+          installed=$("$HOME/.local/bin/vibe-acp" --version)
+          echo "$installed"
+          case "$installed" in
+            *" 3.1.4") ;;
+            *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
+          esac
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
