@@ -73,7 +73,7 @@ jobs:
     steps:
       # 只取执行器仓库的配置面；执行代码来自 Release 包，不从检出目录运行。
       - name: Checkout gateway config
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: GregTech6CE/ai-gateway
           ref: ${{ inputs.gateway_ref }}
@@ -126,7 +126,7 @@ jobs:
           tar -xzf "$work/$archive" -C .gateway/apps/ci --strip-components=1 package/dist
           test -f .gateway/apps/ci/dist/jobs/gate.js
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Gate (read-only)
@@ -147,7 +147,7 @@ jobs:
       # finalize 仍要有执行器可渲染失败结论。
       - name: Upload gate bundle
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gate-bundle-${{ github.run_id }}
           path: .gateway
@@ -187,7 +187,7 @@ jobs:
       # 不需要 setup-uv 与 PyPI。缓存解压后的目录，key 固定为平台与版本。
       - name: Cache vibe-acp
         id: vibe-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .tools/vibe-acp
           key: vibe-acp-linux-x86_64-3.1.4
@@ -212,24 +212,24 @@ jobs:
             *" 3.1.4") ;;
             *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
           esac
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Download gate bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: gate-bundle-${{ github.run_id }}
           path: .gateway
       # 镜像缓存按内容寻址：恢复用前缀取最近一份，保存用主分支 HEAD SHA。
       - name: Restore GT6 mirror
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .cache/gt6.git
           key: ${{ needs.gate.outputs.cache_prefix }}-${{ github.run_id }}
           restore-keys: ${{ needs.gate.outputs.cache_prefix }}-
       - name: Restore golden mirror
         id: golden-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .cache/golden.git
           key: golden-${{ needs.gate.outputs.golden_commit }}
@@ -300,14 +300,14 @@ jobs:
       - name: Save GT6 mirror
         if: always() && steps.sync-mirrors.outputs.gt6_changed == 'true'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .cache/gt6.git
           key: ${{ needs.gate.outputs.cache_prefix }}-${{ steps.sync-mirrors.outputs.gt6_sha }}
       - name: Save golden mirror
         if: always() && steps.golden-cache.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .cache/golden.git
           key: golden-${{ needs.gate.outputs.golden_commit }}
@@ -329,7 +329,7 @@ jobs:
       # 上传闸门：任一文件扫描失败就不提供产物目录，避免未脱敏内容进入公开 artifact。
       - name: Upload analysis outputs
         if: always() && steps.analysis.outputs.scan_upload == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: analysis-${{ github.run_id }}
           path: .gateway/outputs
@@ -338,7 +338,7 @@ jobs:
       # 扫描失败时只留报告：result.json 自身已脱敏，只含状态与命中清单。
       - name: Upload scan report
         if: always() && steps.analysis.outputs.scan_upload != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: analysis-${{ github.run_id }}-report
           path: .gateway/outputs/result.json
@@ -356,18 +356,18 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Download gate bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: gate-bundle-${{ github.run_id }}
           path: .gateway
       - name: Download analysis outputs
         if: needs.analysis.outputs.scan_upload == 'true'
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: analysis-${{ github.run_id }}
           path: .gateway/outputs
@@ -375,7 +375,7 @@ jobs:
       - name: Download scan report
         if: needs.analysis.result != 'skipped' && needs.analysis.outputs.scan_upload != 'true'
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: analysis-${{ github.run_id }}-report
           path: .gateway/outputs
