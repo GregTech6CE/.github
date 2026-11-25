@@ -2,7 +2,7 @@ name: AI Issue Runner
 
 # 组织级 issue 分析执行层。只以 workflow_call 暴露：业务仓的触发薄壳负责事件过滤与
 # 防刷判定，本文件负责执行与写回。执行器代码由 ai-gateway 的 `snapshot` Release 发布，
-# 本工作流不安装依赖、不编译任何代码。
+# 本工作流不编译任何代码；ACP 工具直接使用官方预编译包。
 #
 # 权限与凭据边界（改动时逐条保持）：
 # - 顶层 permissions 为空，权限只在真正需要的 job 内声明；
@@ -26,7 +26,7 @@ on:
         type: string
         default: ""
       dry_run:
-        description: 为 true 时只跑 fetch/gate/analysis、不发评论
+        description: 为 true 时只跑 gate/analysis、不发评论
         required: false
         type: string
         default: "false"
@@ -52,13 +52,24 @@ env:
   CI_ROOT: .gateway
 
 jobs:
-  fetch:
+  # 前置只读 Job：配置面、执行器与 gate 判定一次完成，产物供 analysis 与 finalize 复用。
+  gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
       ARTIFACT_BASE: https://github.com/GregTech6CE/ai-gateway/releases/download/snapshot
+    outputs:
+      decision: ${{ steps.gate.outputs.decision }}
+      reason: ${{ steps.gate.outputs.reason }}
+      code_repo: ${{ steps.gate.outputs.code_repo }}
+      code_ref: ${{ steps.gate.outputs.code_ref }}
+      code_refs: ${{ steps.gate.outputs.code_refs }}
+      golden_repo: ${{ steps.gate.outputs.golden_repo }}
+      golden_commit: ${{ steps.gate.outputs.golden_commit }}
+      cache_prefix: ${{ steps.gate.outputs.cache_prefix }}
+      issue_title: ${{ steps.gate.outputs.issue_title }}
     steps:
       # 只取执行器仓库的配置面；执行代码来自 Release 包，不从检出目录运行。
       - name: Checkout gateway config
@@ -73,44 +84,7 @@ jobs:
             templates
           persist-credentials: false
 
-      # 安装在无 harden-runner 的 fetch 中完成：analysis 的白名单不放行
-      # PyPI / Astral，工具只通过缓存传递。
-      - name: Setup uv
-        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
-        with:
-          version: "0.13.9"
-          enable-cache: false
-      - name: Restore uv toolchain
-        id: uv-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.local/share/uv
-            ~/.local/bin
-          key: uv-mistral-vibe-${{ runner.os }}-3.1.4
-      - name: Install mistral-vibe
-        env:
-          CACHE_HIT: ${{ steps.uv-cache.outputs.cache-hit }}
-        run: |
-          set -euo pipefail
-          # setup-uv 默认把 Python 放进 runner 临时目录；显式落回缓存路径，
-          # 让工具 venv 的 shebang 在 analysis 恢复后仍然有效。
-          export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/uv/python"
-          if [ "${CACHE_HIT:-false}" != "true" ]; then
-            uv tool install --python 3.14 mistral-vibe==3.1.4
-          fi
-          if [ ! -x "$HOME/.local/bin/vibe-acp" ]; then
-            echo "::error::缓存中没有 vibe-acp"
-            exit 1
-          fi
-          installed=$("$HOME/.local/bin/vibe-acp" --version)
-          echo "$installed"
-          case "$installed" in
-            *" 3.1.4") ;;
-            *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
-          esac
-
-      # 下载与校验集中在 fetch：下游 analysis 的 harden-runner 不需要为 Release CDN 放宽。
+      # 下载与校验集中在门禁 Job：analysis 的 harden-runner 不需要为 Release CDN 放宽。
       - name: Download CI bundle
         run: |
           set -euo pipefail
@@ -152,41 +126,9 @@ jobs:
           tar -xzf "$work/$archive" -C .gateway/apps/ci --strip-components=1 package/dist
           test -f .gateway/apps/ci/dist/jobs/gate.js
 
-      - name: Upload CI bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-bundle-${{ github.run_id }}
-          path: .gateway
-          # 搜索根是隐藏目录，默认的隐藏文件过滤会把整棵目录跳过。
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 7
-
-  gate:
-    needs: fetch
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    outputs:
-      decision: ${{ steps.gate.outputs.decision }}
-      reason: ${{ steps.gate.outputs.reason }}
-      code_repo: ${{ steps.gate.outputs.code_repo }}
-      code_ref: ${{ steps.gate.outputs.code_ref }}
-      code_refs: ${{ steps.gate.outputs.code_refs }}
-      golden_repo: ${{ steps.gate.outputs.golden_repo }}
-      golden_commit: ${{ steps.gate.outputs.golden_commit }}
-      cache_prefix: ${{ steps.gate.outputs.cache_prefix }}
-      issue_title: ${{ steps.gate.outputs.issue_title }}
-    steps:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Download CI bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: ci-bundle-${{ github.run_id }}
-          path: .gateway
       - name: Gate (read-only)
         id: gate
         env:
@@ -201,13 +143,17 @@ jobs:
           BOT_ENABLED: ${{ vars.BOT_ENABLED }}
           MODEL_HEALTH: ${{ vars.MODEL_HEALTH }}
         run: node .gateway/apps/ci/dist/jobs/gate.js
-      - name: Upload gate inputs
+      # 单份产物同时携带执行器、配置与 gate 输入：gate 拒绝或 analysis 跳过时，
+      # finalize 仍要有执行器可渲染失败结论。
+      - name: Upload gate bundle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-${{ github.run_id }}
-          path: .gateway/inputs
-          if-no-files-found: ignore
+          name: gate-bundle-${{ github.run_id }}
+          path: .gateway
+          # 搜索根是隐藏目录，默认的隐藏文件过滤会把整棵目录跳过。
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 30
 
   analysis:
@@ -217,6 +163,8 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: read
+    outputs:
+      scan_upload: ${{ steps.analysis.outputs.scan_upload }}
     steps:
       # 出网白名单：与 deploy/egress-allowlist.txt 对齐。
       # 改这里时同步改那份文件，否则 Docker 侧与 CI 侧的边界会漂移。
@@ -235,24 +183,30 @@ jobs:
             api.mistral.ai:443
             chat.mistral.ai:443
             api.cline.bot:443
-      # 工具由 fetch 安装并写入同一 key；这里只恢复，不再访问 PyPI/Astral。
-      - name: Restore uv toolchain
-        uses: actions/cache/restore@v4
+      # 预编译包从 Releases 直拉：github.com 与 *.githubusercontent.com 已在白名单内，
+      # 不需要 setup-uv 与 PyPI。缓存解压后的目录，key 固定为平台与版本。
+      - name: Cache vibe-acp
+        id: vibe-cache
+        uses: actions/cache@v4
         with:
-          path: |
-            ~/.local/share/uv
-            ~/.local/bin
-          key: uv-mistral-vibe-${{ runner.os }}-3.1.4
-          fail-on-cache-miss: true
+          path: .tools/vibe-acp
+          key: vibe-acp-linux-x86_64-3.1.4
+      - name: Install vibe-acp
+        if: steps.vibe-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .tools/vibe-acp
+          archive="$RUNNER_TEMP/vibe-acp-linux-x86_64-3.1.4.tar.gz"
+          curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 600 \
+            -o "$archive" \
+            "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.4/vibe-acp-linux-x86_64-3.1.4.tar.gz"
+          echo "934a79356755821a31e6ce1aee7f7f1eacb6b1e6c78901acf1eb7fc4650aece7  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C .tools/vibe-acp
       - name: Verify vibe-acp
         run: |
           set -euo pipefail
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          if [ ! -x "$HOME/.local/bin/vibe-acp" ]; then
-            echo "::error::缓存中没有 vibe-acp"
-            exit 1
-          fi
-          installed=$("$HOME/.local/bin/vibe-acp" --version)
+          echo "$PWD/.tools/vibe-acp" >> "$GITHUB_PATH"
+          installed=$("$PWD/.tools/vibe-acp/vibe-acp" --version)
           echo "$installed"
           case "$installed" in
             *" 3.1.4") ;;
@@ -261,16 +215,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Download CI bundle
+      - name: Download gate bundle
         uses: actions/download-artifact@v4
         with:
-          name: ci-bundle-${{ github.run_id }}
+          name: gate-bundle-${{ github.run_id }}
           path: .gateway
-      - name: Download gate inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: gate-${{ github.run_id }}
-          path: .gateway/inputs
+      # 镜像缓存按内容寻址：恢复用前缀取最近一份，保存用主分支 HEAD SHA。
       - name: Restore GT6 mirror
         uses: actions/cache/restore@v4
         with:
@@ -278,12 +228,14 @@ jobs:
           key: ${{ needs.gate.outputs.cache_prefix }}-${{ github.run_id }}
           restore-keys: ${{ needs.gate.outputs.cache_prefix }}-
       - name: Restore golden mirror
+        id: golden-cache
         uses: actions/cache/restore@v4
         with:
           path: .cache/golden.git
           key: golden-${{ needs.gate.outputs.golden_commit }}
           restore-keys: golden-
       - name: Sync mirror and create worktrees
+        id: sync-mirrors
         env:
           CODE_REPO: ${{ needs.gate.outputs.code_repo }}
           CODE_REFS: ${{ needs.gate.outputs.code_refs }}
@@ -292,7 +244,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .cache .gateway/code
+          gt6_before=""
           if [ -d .cache/gt6.git ]; then
+            gt6_before=$(git -C .cache/gt6.git rev-parse --verify -q refs/heads/master || true)
             git -C .cache/gt6.git remote set-url origin "https://github.com/$CODE_REPO.git"
             # 缓存会带上一次运行的 worktree 注册信息；工作区路径变化后 fetch 会拒绝更新已登记的分支。
             git -C .cache/gt6.git worktree prune
@@ -300,6 +254,13 @@ jobs:
             git -C .cache/gt6.git fetch --prune --tags
           else
             git clone --mirror "https://github.com/$CODE_REPO.git" .cache/gt6.git
+          fi
+          gt6_after=$(git -C .cache/gt6.git rev-parse refs/heads/master)
+          echo "gt6_sha=$gt6_after" >> "$GITHUB_OUTPUT"
+          if [ "$gt6_before" != "$gt6_after" ]; then
+            echo "gt6_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gt6_changed=false" >> "$GITHUB_OUTPUT"
           fi
           worktree_root="$PWD/.gateway/code"
           primary=""
@@ -321,7 +282,10 @@ jobs:
               git -C .cache/golden.git remote set-url origin "https://github.com/$GOLDEN_REPO.git"
               git -C .cache/golden.git worktree prune
               rm -rf .cache/golden.git/worktrees
-              git -C .cache/golden.git fetch --prune --tags || true
+              # golden 是固定提交：缓存里已经有它就不再联网。
+              if ! git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
+                git -C .cache/golden.git fetch --prune --tags || true
+              fi
             else
               git clone --mirror "https://github.com/$GOLDEN_REPO.git" .cache/golden.git
             fi
@@ -332,15 +296,16 @@ jobs:
               echo "golden commit $GOLDEN_COMMIT not reachable; skipping"
             fi
           fi
+      # 只有主分支前进时才落一份新缓存；同一 SHA 重复保存既浪费又会报 save failed。
       - name: Save GT6 mirror
-        if: always()
+        if: always() && steps.sync-mirrors.outputs.gt6_changed == 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: .cache/gt6.git
-          key: ${{ needs.gate.outputs.cache_prefix }}-${{ github.run_id }}
+          key: ${{ needs.gate.outputs.cache_prefix }}-${{ steps.sync-mirrors.outputs.gt6_sha }}
       - name: Save golden mirror
-        if: always()
+        if: always() && steps.golden-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -394,24 +359,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Download CI bundle
+      - name: Download gate bundle
         uses: actions/download-artifact@v4
         with:
-          name: ci-bundle-${{ github.run_id }}
+          name: gate-bundle-${{ github.run_id }}
           path: .gateway
-      - name: Download gate inputs
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: gate-${{ github.run_id }}
-          path: .gateway/inputs
       - name: Download analysis outputs
+        if: needs.analysis.outputs.scan_upload == 'true'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: analysis-${{ github.run_id }}
           path: .gateway/outputs
+      # analysis 跳过时两份产物都不存在；扫描未放行时只有报告。条件即产物存在性。
       - name: Download scan report
+        if: needs.analysis.result != 'skipped' && needs.analysis.outputs.scan_upload != 'true'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -419,6 +381,7 @@ jobs:
           path: .gateway/outputs
       - name: App token (issues:write on this repository)
         id: app_issue
+        if: ${{ (inputs.dry_run || 'false') != 'true' }}
         uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ vars.GT6CE_APP_CLIENT_ID }}
