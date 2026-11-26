@@ -320,10 +320,6 @@ jobs:
         with:
           path: .cache/golden.git
           key: golden-${{ needs.gate.outputs.golden_commit }}
-      - name: Build code manifest
-        env:
-          REPO: ${{ github.repository }}
-        run: node .gateway/apps/ci/dist/jobs/manifest.js
       - name: Prefetch attachments
         run: node .gateway/apps/ci/dist/jobs/prefetch.js
       - name: Analyse issue
