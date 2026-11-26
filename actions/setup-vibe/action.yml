@@ -1,0 +1,75 @@
+name: Setup vibe-acp
+description: 恢复或下载经 SHA-256 校验的 vibe-acp 预编译包，并按需写入缓存。
+
+inputs:
+  version:
+    description: vibe-acp 版本号
+    required: false
+    default: '3.1.4'
+  sha256:
+    description: vibe-acp 官方预编译压缩包的 SHA-256 校验和
+    required: false
+    default: '934a79356755821a31e6ce1aee7f7f1eacb6b1e6c78901acf1eb7fc4650aece7'
+  install-dir:
+    description: 解压安装目录
+    required: false
+    default: '.tools/vibe-acp'
+  save-cache:
+    description: 未命中时是否保存缓存（仅可信保活工作流设为 true）
+    required: false
+    default: 'false'
+
+outputs:
+  cache-hit:
+    description: 是否命中 vibe-acp 缓存
+    value: ${{ steps.vibe-cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore vibe-acp
+      id: vibe-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ inputs.install-dir }}
+        key: vibe-acp-linux-x86_64-${{ inputs.version }}
+
+    - name: Install vibe-acp
+      if: steps.vibe-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VIBE_VERSION: ${{ inputs.version }}
+        VIBE_SHA256: ${{ inputs.sha256 }}
+        INSTALL_DIR: ${{ inputs.install-dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$INSTALL_DIR"
+        archive="$RUNNER_TEMP/vibe-acp-linux-x86_64-${VIBE_VERSION}.tar.gz"
+        curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 600 \
+          -o "$archive" \
+          "https://github.com/mistralai/mistral-vibe/releases/download/v${VIBE_VERSION}/vibe-acp-linux-x86_64-${VIBE_VERSION}.tar.gz"
+        echo "${VIBE_SHA256}  $archive" | sha256sum -c -
+        tar -xzf "$archive" -C "$INSTALL_DIR"
+
+    - name: Verify vibe-acp
+      shell: bash
+      env:
+        VIBE_VERSION: ${{ inputs.version }}
+        INSTALL_DIR: ${{ inputs.install-dir }}
+      run: |
+        set -euo pipefail
+        abs_dir=$(cd "$INSTALL_DIR" && pwd)
+        echo "$abs_dir" >> "$GITHUB_PATH"
+        installed=$("$abs_dir/vibe-acp" --version)
+        echo "$installed"
+        case "$installed" in
+          *" $VIBE_VERSION") ;;
+          *) echo "::error::vibe-acp 版本不是 $VIBE_VERSION：$installed"; exit 1 ;;
+        esac
+
+    - name: Save vibe-acp
+      if: inputs.save-cache == 'true' && steps.vibe-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ inputs.install-dir }}
+        key: vibe-acp-linux-x86_64-${{ inputs.version }}

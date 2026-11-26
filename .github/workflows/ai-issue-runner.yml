@@ -58,6 +58,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      issues: read
     env:
       ARTIFACT_BASE: https://github.com/GregTech6CE/ai-gateway/releases/download/snapshot
     outputs:
@@ -139,6 +140,7 @@ jobs:
           REQUEST_ID: ${{ github.run_id }}
           FORCE: ${{ inputs.force }}
           SELF_TOKEN: ${{ github.token }}
+          GH_RO_TOKEN: ${{ github.token }}
           B_REPO: ${{ github.repository }}
           BOT_ENABLED: ${{ vars.BOT_ENABLED }}
           MODEL_HEALTH: ${{ vars.MODEL_HEALTH }}
@@ -183,60 +185,13 @@ jobs:
             api.mistral.ai:443
             chat.mistral.ai:443
             api.cline.bot:443
-      # 预编译包从 Releases 直拉：github.com 与 *.githubusercontent.com 已在白名单内，
-      # 不需要 setup-uv 与 PyPI。缓存解压后的目录，key 固定为平台与版本。
-      # 只读恢复：缓存写入限定手动触发，其余事件由 ai-cache-warm.yml 保活。
-      - name: Cache vibe-acp
-        id: vibe-cache
-        uses: actions/cache/restore@v6
+      # 工具与镜像同步复用组织级组合 Action；analysis 仅只读消费缓存，写入统一由 ai-cache-warm.yml 负责。
+      - name: Setup vibe-acp
+        uses: GregTech6CE/.github/actions/setup-vibe@master
         with:
-          path: .tools/vibe-acp
-          key: vibe-acp-linux-x86_64-3.1.4
-      - name: Install vibe-acp
-        if: steps.vibe-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p .tools/vibe-acp
-          archive="$RUNNER_TEMP/vibe-acp-linux-x86_64-3.1.4.tar.gz"
-          curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 600 \
-            -o "$archive" \
-            "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.4/vibe-acp-linux-x86_64-3.1.4.tar.gz"
-          echo "934a79356755821a31e6ce1aee7f7f1eacb6b1e6c78901acf1eb7fc4650aece7  $archive" | sha256sum -c -
-          tar -xzf "$archive" -C .tools/vibe-acp
-      - name: Verify vibe-acp
-        run: |
-          set -euo pipefail
-          echo "$PWD/.tools/vibe-acp" >> "$GITHUB_PATH"
-          installed=$("$PWD/.tools/vibe-acp/vibe-acp" --version)
-          echo "$installed"
-          case "$installed" in
-            *" 3.1.4") ;;
-            *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
-          esac
-      # 冷启动只在手动触发时补齐缓存；issues / issue_comment 不写缓存。
-      - name: Save vibe-acp
-        if: github.event_name == 'workflow_dispatch' && steps.vibe-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: .tools/vibe-acp
-          key: vibe-acp-linux-x86_64-3.1.4
-      - name: Install ripgrep
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/rg-bin"
-          archive="$RUNNER_TEMP/ripgrep-16.0.0-x86_64-unknown-linux-musl.tar.gz"
-          curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 180 \
-            -o "$archive" \
-            "https://github.com/BurntSushi/ripgrep/releases/download/16.0.0/ripgrep-16.0.0-x86_64-unknown-linux-musl.tar.gz"
-          echo "54268ab4643c00a290a29b0086066d64b3f56236dd805ec64629a86f9bd29fd0  $archive" | sha256sum -c -
-          tar -xzf "$archive" -C "$RUNNER_TEMP/rg-bin" --strip-components=1 ripgrep-16.0.0-x86_64-unknown-linux-musl/rg
-          echo "$RUNNER_TEMP/rg-bin" >> "$GITHUB_PATH"
-          installed=$("$RUNNER_TEMP/rg-bin/rg" --version | head -n 1)
-          echo "$installed"
-          case "$installed" in
-            "ripgrep 16.0.0"*) ;;
-            *) echo "::error::ripgrep 版本不是 16.0.0：$installed"; exit 1 ;;
-          esac
+          save-cache: 'false'
+      - name: Setup ripgrep
+        uses: GregTech6CE/.github/actions/setup-ripgrep@master
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
@@ -245,98 +200,17 @@ jobs:
         with:
           name: gate-bundle-${{ github.run_id }}
           path: .gateway
-      # 镜像缓存按内容寻址：恢复用前缀取最近一份，保存用主分支 HEAD SHA。
-      - name: Restore GT6 mirror
-        uses: actions/cache/restore@v6
+      - name: Sync mirrors and create worktrees
+        uses: GregTech6CE/.github/actions/sync-mirrors@master
         with:
-          path: .cache/gt6.git
-          key: ${{ needs.gate.outputs.cache_prefix }}-${{ github.run_id }}
-          restore-keys: ${{ needs.gate.outputs.cache_prefix }}-
-      - name: Restore golden mirror
-        id: golden-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: .cache/golden.git
-          key: golden-${{ needs.gate.outputs.golden_commit }}
-          restore-keys: golden-
-      - name: Sync mirror and create worktrees
-        id: sync-mirrors
-        env:
-          CODE_REPO: ${{ needs.gate.outputs.code_repo }}
-          CODE_REFS: ${{ needs.gate.outputs.code_refs }}
-          GOLDEN_REPO: ${{ needs.gate.outputs.golden_repo }}
-          GOLDEN_COMMIT: ${{ needs.gate.outputs.golden_commit }}
-        run: |
-          set -euo pipefail
-          mkdir -p .cache .gateway/code
-          gt6_before=""
-          if [ -d .cache/gt6.git ]; then
-            gt6_before=$(git -C .cache/gt6.git rev-parse --verify -q refs/heads/master || true)
-            git -C .cache/gt6.git remote set-url origin "https://github.com/$CODE_REPO.git"
-            # 缓存会带上一次运行的 worktree 注册信息；工作区路径变化后 fetch 会拒绝更新已登记的分支。
-            git -C .cache/gt6.git worktree prune
-            rm -rf .cache/gt6.git/worktrees
-            git -C .cache/gt6.git fetch --prune --tags
-          else
-            git clone --mirror "https://github.com/$CODE_REPO.git" .cache/gt6.git
-          fi
-          gt6_after=$(git -C .cache/gt6.git rev-parse refs/heads/master)
-          echo "gt6_sha=$gt6_after" >> "$GITHUB_OUTPUT"
-          if [ "$gt6_before" != "$gt6_after" ]; then
-            echo "gt6_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "gt6_changed=false" >> "$GITHUB_OUTPUT"
-          fi
-          worktree_root="$PWD/.gateway/code"
-          primary=""
-          for ref in $CODE_REFS; do
-            slug=$(printf '%s' "$ref" | tr '/ ' '__')
-            if [ -z "$primary" ]; then
-              git -C .cache/gt6.git worktree add -f "$worktree_root/$slug" "$ref" || \
-                git -C .cache/gt6.git worktree add -f "$worktree_root/$slug" master
-              primary="$slug"
-            else
-              git -C .cache/gt6.git worktree add -f "$worktree_root/$slug" "$ref" || \
-                echo "ref $ref unavailable; skipping"
-            fi
-          done
-          ln -sfn "$primary" .gateway/code/current
-          # golden 是上游原版 GT6 的固定提交：6CE 的行号引用与行为对齐都以它为基准。
-          if [ -n "${GOLDEN_REPO:-}" ] && [ -n "${GOLDEN_COMMIT:-}" ]; then
-            if [ -d .cache/golden.git ]; then
-              git -C .cache/golden.git remote set-url origin "https://github.com/$GOLDEN_REPO.git"
-              git -C .cache/golden.git worktree prune
-              rm -rf .cache/golden.git/worktrees
-              # golden 是固定提交：缓存里已经有它就不再联网。
-              if ! git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
-                git -C .cache/golden.git fetch --prune --tags || true
-              fi
-            else
-              git clone --mirror "https://github.com/$GOLDEN_REPO.git" .cache/golden.git
-            fi
-            if git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
-              git -C .cache/golden.git worktree add -f "$worktree_root/golden" "$GOLDEN_COMMIT"
-              echo "golden: $GOLDEN_REPO@$GOLDEN_COMMIT"
-            else
-              echo "golden commit $GOLDEN_COMMIT not reachable; skipping"
-            fi
-          fi
-      # 只有主分支前进时才落一份新缓存；同一 SHA 重复保存既浪费又会报 save failed。
-      # 缓存写入同样限定手动触发，被动事件由 ai-cache-warm.yml 的定时保活维护。
-      - name: Save GT6 mirror
-        if: always() && github.event_name == 'workflow_dispatch' && steps.sync-mirrors.outputs.gt6_changed == 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v6
-        with:
-          path: .cache/gt6.git
-          key: ${{ needs.gate.outputs.cache_prefix }}-${{ steps.sync-mirrors.outputs.gt6_sha }}
-      - name: Save golden mirror
-        if: always() && github.event_name == 'workflow_dispatch' && steps.golden-cache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v6
-        with:
-          path: .cache/golden.git
-          key: golden-${{ needs.gate.outputs.golden_commit }}
+          code-repo: ${{ needs.gate.outputs.code_repo }}
+          code-refs: ${{ needs.gate.outputs.code_refs }}
+          cache-prefix: ${{ needs.gate.outputs.cache_prefix }}
+          golden-repo: ${{ needs.gate.outputs.golden_repo }}
+          golden-commit: ${{ needs.gate.outputs.golden_commit }}
+          worktree-root: .gateway/code
+          create-worktrees: 'true'
+          save-cache: 'false'
       - name: Prefetch attachments
         run: node .gateway/apps/ci/dist/jobs/prefetch.js
       - name: Analyse issue
@@ -449,3 +323,68 @@ jobs:
           B_REPO: ${{ github.repository }}
           MODEL_HEALTH_PATH: outputs/model_health.json
         run: node .gateway/apps/ci/dist/jobs/update-health.js
+      - name: Write job summary
+        if: always()
+        env:
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ inputs.issue }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs')
+
+          function readJson(path) {
+            try {
+              return JSON.parse(fs.readFileSync(path, 'utf8'))
+            } catch {
+              return null
+            }
+          }
+
+          function cell(value) {
+            if (value === undefined || value === null || value === '') return '-'
+            return String(value).replace(/\r?\n/g, ' ').replace(/\|/g, '\\|')
+          }
+
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY
+          if (!summaryPath) process.exit(0)
+
+          const verdict = readJson('.gateway/inputs/verdict.json') ?? {}
+          const result = readJson('.gateway/outputs/result.json') ?? {}
+          const scan =
+            result && typeof result.secret_scan === 'object' && result.secret_scan !== null
+              ? result.secret_scan.ok
+              : undefined
+
+          const decisionText = verdict.decision
+            ? verdict.reason
+              ? `${verdict.decision} (${verdict.reason})`
+              : verdict.decision
+            : '-'
+          const statusText = result.status
+            ? result.reason
+              ? `${result.status} (${result.reason})`
+              : result.status
+            : '-'
+          const elapsedText =
+            typeof result.elapsed_sec === 'number' ? `${result.elapsed_sec}s` : result.elapsed_sec
+
+          const lines = [
+            `### ${cell(process.env.REPO)}#${cell(process.env.ISSUE)} 执行摘要`,
+            '',
+            '| 项目 | 值 |',
+            '| --- | --- |',
+            `| 门禁决策 | ${cell(decisionText)} |`,
+            `| 分析状态 | ${cell(statusText)} |`,
+            `| 入口 | ${cell(result.entry_id)} |`,
+            `| 步数 | ${cell(result.steps)} |`,
+            `| Tokens | ${cell(result.tokens)} |`,
+            `| 耗时 | ${cell(elapsedText)} |`,
+            `| 置信度 | ${cell(result.confidence)} |`,
+            `| 脱敏扫描通过 | ${cell(scan)} |`,
+            `| dry_run | ${cell(process.env.DRY_RUN)} |`,
+            '',
+          ]
+          fs.appendFileSync(summaryPath, lines.join('\n'))
+          NODE

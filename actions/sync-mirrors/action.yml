@@ -1,0 +1,176 @@
+name: Sync mirrors
+description: 恢复并同步代码仓与上游基准仓 bare mirror，按需写入缓存并创建只读 worktree。
+
+inputs:
+  code-repo:
+    description: 目标代码仓（owner/repo）
+    required: true
+  code-refs:
+    description: 需要检出为 worktree 的 ref 列表（空格分隔，仅 create-worktrees 为 true 时使用）
+    required: false
+    default: ''
+  cache-prefix:
+    description: 代码仓镜像缓存键前缀
+    required: true
+  golden-repo:
+    description: 上游基准仓（owner/repo，可为空）
+    required: false
+    default: ''
+  golden-commit:
+    description: 上游基准仓固定提交 SHA（可为空）
+    required: false
+    default: ''
+  worktree-root:
+    description: worktree 检出根目录
+    required: false
+    default: '.gateway/code'
+  create-worktrees:
+    description: 是否为 code-refs 与 golden 创建 worktree（保活工作流设为 false）
+    required: false
+    default: 'true'
+  save-cache:
+    description: 是否在镜像变更或未命中时保存缓存（仅可信保活工作流设为 true）
+    required: false
+    default: 'false'
+
+outputs:
+  gt6-sha:
+    description: 同步后代码仓 master 分支 SHA
+    value: ${{ steps.sync-gt6.outputs.gt6_sha }}
+  gt6-changed:
+    description: 代码仓 master 是否较缓存前进
+    value: ${{ steps.sync-gt6.outputs.gt6_changed }}
+  golden-cache-hit:
+    description: 上游基准仓镜像是否精确命中缓存
+    value: ${{ steps.golden-cache.outputs.cache-hit }}
+  golden-ready:
+    description: 上游基准仓固定提交是否就绪
+    value: ${{ steps.sync-golden.outputs.golden_ready }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore GT6 mirror
+      uses: actions/cache/restore@v6
+      with:
+        path: .cache/gt6.git
+        key: ${{ inputs.cache-prefix }}-${{ github.run_id }}
+        restore-keys: ${{ inputs.cache-prefix }}-
+
+    - name: Sync GT6 mirror
+      id: sync-gt6
+      shell: bash
+      env:
+        CODE_REPO: ${{ inputs.code-repo }}
+      run: |
+        set -euo pipefail
+        mkdir -p .cache
+        gt6_before=""
+        if [ -d .cache/gt6.git ]; then
+          gt6_before=$(git -C .cache/gt6.git rev-parse --verify -q refs/heads/master || true)
+          git -C .cache/gt6.git remote set-url origin "https://github.com/$CODE_REPO.git"
+          # 缓存会带上一次运行的 worktree 注册信息；工作区路径变化后 fetch 会拒绝更新已登记的分支。
+          git -C .cache/gt6.git worktree prune
+          rm -rf .cache/gt6.git/worktrees
+          git -C .cache/gt6.git fetch --prune --tags
+        else
+          git clone --mirror "https://github.com/$CODE_REPO.git" .cache/gt6.git
+        fi
+        gt6_after=$(git -C .cache/gt6.git rev-parse refs/heads/master)
+        echo "gt6 mirror: ${gt6_before:-<empty>} -> $gt6_after"
+        echo "gt6_sha=$gt6_after" >> "$GITHUB_OUTPUT"
+        if [ "$gt6_before" != "$gt6_after" ]; then
+          echo "gt6_changed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "gt6_changed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Save GT6 mirror
+      if: inputs.save-cache == 'true' && steps.sync-gt6.outputs.gt6_changed == 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: .cache/gt6.git
+        key: ${{ inputs.cache-prefix }}-${{ steps.sync-gt6.outputs.gt6_sha }}
+
+    - name: Restore golden mirror
+      id: golden-cache
+      if: inputs.golden-commit != ''
+      uses: actions/cache/restore@v6
+      with:
+        path: .cache/golden.git
+        key: golden-${{ inputs.golden-commit }}
+        restore-keys: golden-
+
+    - name: Sync golden mirror
+      id: sync-golden
+      if: inputs.golden-repo != '' && inputs.golden-commit != '' && steps.golden-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GOLDEN_REPO: ${{ inputs.golden-repo }}
+        GOLDEN_COMMIT: ${{ inputs.golden-commit }}
+      run: |
+        set -euo pipefail
+        mkdir -p .cache
+        if [ -d .cache/golden.git ]; then
+          git -C .cache/golden.git remote set-url origin "https://github.com/$GOLDEN_REPO.git"
+          git -C .cache/golden.git worktree prune
+          rm -rf .cache/golden.git/worktrees
+          # 本地已有固定提交时不再联网。
+          if ! git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
+            git -C .cache/golden.git fetch --prune --tags || true
+          fi
+        else
+          git clone --mirror "https://github.com/$GOLDEN_REPO.git" .cache/golden.git
+        fi
+        if git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
+          echo "golden: $GOLDEN_REPO@$GOLDEN_COMMIT"
+          echo "golden_ready=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "golden commit $GOLDEN_COMMIT not reachable; skipping"
+          echo "golden_ready=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Save golden mirror
+      if: inputs.save-cache == 'true' && inputs.golden-commit != '' && steps.golden-cache.outputs.cache-hit != 'true' && steps.sync-golden.outputs.golden_ready == 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: .cache/golden.git
+        key: golden-${{ inputs.golden-commit }}
+
+    - name: Create worktrees
+      if: inputs.create-worktrees == 'true'
+      shell: bash
+      env:
+        CODE_REFS: ${{ inputs.code-refs }}
+        GOLDEN_REPO: ${{ inputs.golden-repo }}
+        GOLDEN_COMMIT: ${{ inputs.golden-commit }}
+        WORKTREE_ROOT: ${{ inputs.worktree-root }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$WORKTREE_ROOT"
+        worktree_root=$(cd "$WORKTREE_ROOT" && pwd)
+        refs="${CODE_REFS:-master}"
+        primary=""
+        for ref in $refs; do
+          slug=$(printf '%s' "$ref" | tr '/ ' '__')
+          if [ -z "$primary" ]; then
+            git -C .cache/gt6.git worktree add -f "$worktree_root/$slug" "$ref" || \
+              git -C .cache/gt6.git worktree add -f "$worktree_root/$slug" master
+            primary="$slug"
+          else
+            git -C .cache/gt6.git worktree add -f "$worktree_root/$slug" "$ref" || \
+              echo "ref $ref unavailable; skipping"
+          fi
+        done
+        ln -sfn "$primary" "$worktree_root/current"
+
+        if [ -n "${GOLDEN_REPO:-}" ] && [ -n "${GOLDEN_COMMIT:-}" ] && [ -d .cache/golden.git ]; then
+          git -C .cache/golden.git worktree prune
+          rm -rf .cache/golden.git/worktrees
+          if git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
+            git -C .cache/golden.git worktree add -f "$worktree_root/golden" "$GOLDEN_COMMIT"
+            echo "golden: $GOLDEN_REPO@$GOLDEN_COMMIT"
+          else
+            echo "golden commit $GOLDEN_COMMIT not reachable; skipping"
+          fi
+        fi

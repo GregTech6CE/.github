@@ -77,112 +77,18 @@ jobs:
           }
           NODE
 
-      # 命中即恢复并刷新访问时间；未命中时在 Verify 通过后由 actions/cache 的收尾步骤保存。
-      - name: Cache vibe-acp
-        id: vibe-cache
-        uses: actions/cache@v6
+      # 复用组织级组合 Action 写入共享缓存：此处是唯一缓存写入口。
+      - name: Setup vibe-acp
+        uses: GregTech6CE/.github/actions/setup-vibe@master
         with:
-          path: .tools/vibe-acp
-          key: vibe-acp-linux-x86_64-3.1.4
-      - name: Install vibe-acp
-        if: steps.vibe-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p .tools/vibe-acp
-          archive="$RUNNER_TEMP/vibe-acp-linux-x86_64-3.1.4.tar.gz"
-          curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 600 \
-            -o "$archive" \
-            "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.4/vibe-acp-linux-x86_64-3.1.4.tar.gz"
-          echo "934a79356755821a31e6ce1aee7f7f1eacb6b1e6c78901acf1eb7fc4650aece7  $archive" | sha256sum -c -
-          tar -xzf "$archive" -C .tools/vibe-acp
-      - name: Verify vibe-acp
-        run: |
-          set -euo pipefail
-          installed=$("$PWD/.tools/vibe-acp/vibe-acp" --version)
-          echo "$installed"
-          case "$installed" in
-            *" 3.1.4") ;;
-            *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
-          esac
+          save-cache: 'true'
 
-      # 镜像缓存按内容寻址：恢复用前缀取最近一份，保存用主分支 HEAD SHA。
-      - name: Restore GT6 mirror
-        uses: actions/cache/restore@v6
+      - name: Sync mirrors
+        uses: GregTech6CE/.github/actions/sync-mirrors@master
         with:
-          path: .cache/gt6.git
-          key: ${{ steps.repo.outputs.cache_prefix }}-${{ github.run_id }}
-          restore-keys: ${{ steps.repo.outputs.cache_prefix }}-
-      - name: Sync GT6 mirror
-        id: sync-mirror
-        env:
-          CODE_REPO: ${{ steps.repo.outputs.code_repo }}
-        run: |
-          set -euo pipefail
-          mkdir -p .cache
-          before=""
-          if [ -d .cache/gt6.git ]; then
-            before=$(git -C .cache/gt6.git rev-parse --verify -q refs/heads/master || true)
-            git -C .cache/gt6.git remote set-url origin "https://github.com/$CODE_REPO.git"
-            # 缓存会带上一次运行的 worktree 注册信息；工作区路径变化后 fetch 会拒绝更新已登记的分支。
-            git -C .cache/gt6.git worktree prune
-            rm -rf .cache/gt6.git/worktrees
-            git -C .cache/gt6.git fetch --prune --tags
-          else
-            git clone --mirror "https://github.com/$CODE_REPO.git" .cache/gt6.git
-          fi
-          after=$(git -C .cache/gt6.git rev-parse refs/heads/master)
-          echo "gt6 mirror: ${before:-<empty>} -> $after"
-          echo "gt6_sha=$after" >> "$GITHUB_OUTPUT"
-          if [ "$before" != "$after" ]; then
-            echo "gt6_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "gt6_changed=false" >> "$GITHUB_OUTPUT"
-          fi
-      # 主分支未移动时不重复保存，避免无意义占用缓存配额。
-      - name: Save GT6 mirror
-        if: steps.sync-mirror.outputs.gt6_changed == 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: .cache/gt6.git
-          key: ${{ steps.repo.outputs.cache_prefix }}-${{ steps.sync-mirror.outputs.gt6_sha }}
-
-      # golden 是上游固定提交：命中即已完整，不联网。
-      - name: Restore golden mirror
-        id: golden-cache
-        if: steps.repo.outputs.golden_commit != ''
-        uses: actions/cache/restore@v6
-        with:
-          path: .cache/golden.git
-          key: golden-${{ steps.repo.outputs.golden_commit }}
-      - name: Sync golden mirror
-        id: golden-sync
-        if: steps.repo.outputs.golden_commit != '' && steps.golden-cache.outputs.cache-hit != 'true'
-        env:
-          GOLDEN_REPO: ${{ steps.repo.outputs.golden_repo }}
-          GOLDEN_COMMIT: ${{ steps.repo.outputs.golden_commit }}
-        run: |
-          set -euo pipefail
-          if [ -d .cache/golden.git ]; then
-            git -C .cache/golden.git remote set-url origin "https://github.com/$GOLDEN_REPO.git"
-            git -C .cache/golden.git worktree prune
-            rm -rf .cache/golden.git/worktrees
-            # 本地已有固定提交时不再联网。
-            if ! git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
-              git -C .cache/golden.git fetch --prune --tags || true
-            fi
-          else
-            git clone --mirror "https://github.com/$GOLDEN_REPO.git" .cache/golden.git
-          fi
-          if git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
-            echo "golden: $GOLDEN_REPO@$GOLDEN_COMMIT"
-            echo "golden_ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "golden commit $GOLDEN_COMMIT not reachable; skipping save"
-            echo "golden_ready=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Save golden mirror
-        if: steps.golden-sync.outputs.golden_ready == 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: .cache/golden.git
-          key: golden-${{ steps.repo.outputs.golden_commit }}
+          code-repo: ${{ steps.repo.outputs.code_repo }}
+          cache-prefix: ${{ steps.repo.outputs.cache_prefix }}
+          golden-repo: ${{ steps.repo.outputs.golden_repo }}
+          golden-commit: ${{ steps.repo.outputs.golden_commit }}
+          create-worktrees: 'false'
+          save-cache: 'true'

@@ -1,0 +1,37 @@
+name: Setup ripgrep
+description: 下载经 SHA-256 校验的官方 ripgrep 静态二进制并加入 PATH。
+
+inputs:
+  version:
+    description: ripgrep 版本号
+    required: false
+    default: '16.0.0'
+  sha256:
+    description: ripgrep 官方压缩包的 SHA-256 校验和
+    required: false
+    default: '54268ab4643c00a290a29b0086066d64b3f56236dd805ec64629a86f9bd29fd0'
+
+runs:
+  using: composite
+  steps:
+    - name: Install ripgrep
+      shell: bash
+      env:
+        RG_VERSION: ${{ inputs.version }}
+        RG_SHA256: ${{ inputs.sha256 }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/rg-bin"
+        archive="$RUNNER_TEMP/ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 180 \
+          -o "$archive" \
+          "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        echo "${RG_SHA256}  $archive" | sha256sum -c -
+        tar -xzf "$archive" -C "$RUNNER_TEMP/rg-bin" --strip-components=1 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg"
+        echo "$RUNNER_TEMP/rg-bin" >> "$GITHUB_PATH"
+        installed=$("$RUNNER_TEMP/rg-bin/rg" --version | head -n 1)
+        echo "$installed"
+        case "$installed" in
+          "ripgrep ${RG_VERSION}"*) ;;
+          *) echo "::error::ripgrep 版本不是 ${RG_VERSION}：$installed"; exit 1 ;;
+        esac
