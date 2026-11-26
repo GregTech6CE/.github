@@ -1,0 +1,188 @@
+name: AI Cache Warm
+
+# 组织级缓存保活。只以 workflow_call 暴露：缓存写入集中在可信的定时与手动触发，
+# issue 分析执行层保持只读缓存。定时入口由业务仓的薄壳工作流提供。
+#
+# 三类缓存与 ai-issue-runner.yml 共用同一套键：
+# - vibe-acp：固定平台与版本，命中即刷新访问时间；
+# - gt6-mirror：<cache_prefix>-<主分支 SHA>，仅在主线前进时保存新副本；
+# - golden：golden-<固定提交>，命中后不再联网。
+on:
+  workflow_call:
+    inputs:
+      gateway_ref:
+        description: 执行器仓库（GregTech6CE/ai-gateway）的 ref
+        required: false
+        type: string
+        default: master
+
+permissions: {}
+
+# 同一仓库的保活串行执行；手动补跑可以取消尚未完成的定时任务。
+concurrency:
+  group: ai-cache-warm-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # 只取配置面；cache_prefix 与 golden 信息都以 repos.json 为准，不在工作流里硬编码。
+      - name: Checkout gateway config
+        uses: actions/checkout@v7
+        with:
+          repository: GregTech6CE/ai-gateway
+          ref: ${{ inputs.gateway_ref }}
+          path: .gateway
+          sparse-checkout: |
+            config
+          persist-credentials: false
+
+      # 与 gate.js 的 cachePrefix 完全一致：gt6-mirror- 加 code_repo 小写、/ 替换为 -。
+      - name: Resolve repository settings
+        id: repo
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs')
+
+          const configPath = '.gateway/config/repos.json'
+          const repos = JSON.parse(fs.readFileSync(configPath, 'utf8')).repos ?? {}
+          const repo = (process.env.REPO ?? '').toLowerCase()
+          const config = repos[repo]
+          if (!config) {
+            console.error(`repos.json 未登记 ${process.env.REPO}`)
+            process.exit(1)
+          }
+
+          const codeRepo = String(config.code_repo ?? '')
+          if (!codeRepo) {
+            console.error(`repos.json 中 ${process.env.REPO} 缺少 code_repo`)
+            process.exit(1)
+          }
+          const golden = config.golden ?? {}
+          const outputs = {
+            code_repo: codeRepo,
+            golden_repo: golden.repo ?? '',
+            golden_commit: golden.commit ?? '',
+            cache_prefix: `gt6-mirror-${codeRepo.toLowerCase().replaceAll('/', '-')}`,
+          }
+          for (const [key, value] of Object.entries(outputs)) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`)
+          }
+          NODE
+
+      # 命中即恢复并刷新访问时间；未命中时在 Verify 通过后由 actions/cache 的收尾步骤保存。
+      - name: Cache vibe-acp
+        id: vibe-cache
+        uses: actions/cache@v6
+        with:
+          path: .tools/vibe-acp
+          key: vibe-acp-linux-x86_64-3.1.4
+      - name: Install vibe-acp
+        if: steps.vibe-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .tools/vibe-acp
+          archive="$RUNNER_TEMP/vibe-acp-linux-x86_64-3.1.4.tar.gz"
+          curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 600 \
+            -o "$archive" \
+            "https://github.com/mistralai/mistral-vibe/releases/download/v3.1.4/vibe-acp-linux-x86_64-3.1.4.tar.gz"
+          echo "934a79356755821a31e6ce1aee7f7f1eacb6b1e6c78901acf1eb7fc4650aece7  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C .tools/vibe-acp
+      - name: Verify vibe-acp
+        run: |
+          set -euo pipefail
+          installed=$("$PWD/.tools/vibe-acp/vibe-acp" --version)
+          echo "$installed"
+          case "$installed" in
+            *" 3.1.4") ;;
+            *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
+          esac
+
+      # 镜像缓存按内容寻址：恢复用前缀取最近一份，保存用主分支 HEAD SHA。
+      - name: Restore GT6 mirror
+        uses: actions/cache/restore@v6
+        with:
+          path: .cache/gt6.git
+          key: ${{ steps.repo.outputs.cache_prefix }}-${{ github.run_id }}
+          restore-keys: ${{ steps.repo.outputs.cache_prefix }}-
+      - name: Sync GT6 mirror
+        id: sync-mirror
+        env:
+          CODE_REPO: ${{ steps.repo.outputs.code_repo }}
+        run: |
+          set -euo pipefail
+          mkdir -p .cache
+          before=""
+          if [ -d .cache/gt6.git ]; then
+            before=$(git -C .cache/gt6.git rev-parse --verify -q refs/heads/master || true)
+            git -C .cache/gt6.git remote set-url origin "https://github.com/$CODE_REPO.git"
+            # 缓存会带上一次运行的 worktree 注册信息；工作区路径变化后 fetch 会拒绝更新已登记的分支。
+            git -C .cache/gt6.git worktree prune
+            rm -rf .cache/gt6.git/worktrees
+            git -C .cache/gt6.git fetch --prune --tags
+          else
+            git clone --mirror "https://github.com/$CODE_REPO.git" .cache/gt6.git
+          fi
+          after=$(git -C .cache/gt6.git rev-parse refs/heads/master)
+          echo "gt6 mirror: ${before:-<empty>} -> $after"
+          echo "gt6_sha=$after" >> "$GITHUB_OUTPUT"
+          if [ "$before" != "$after" ]; then
+            echo "gt6_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gt6_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      # 主分支未移动时不重复保存，避免无意义占用缓存配额。
+      - name: Save GT6 mirror
+        if: steps.sync-mirror.outputs.gt6_changed == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .cache/gt6.git
+          key: ${{ steps.repo.outputs.cache_prefix }}-${{ steps.sync-mirror.outputs.gt6_sha }}
+
+      # golden 是上游固定提交：命中即已完整，不联网。
+      - name: Restore golden mirror
+        id: golden-cache
+        if: steps.repo.outputs.golden_commit != ''
+        uses: actions/cache/restore@v6
+        with:
+          path: .cache/golden.git
+          key: golden-${{ steps.repo.outputs.golden_commit }}
+      - name: Sync golden mirror
+        id: golden-sync
+        if: steps.repo.outputs.golden_commit != '' && steps.golden-cache.outputs.cache-hit != 'true'
+        env:
+          GOLDEN_REPO: ${{ steps.repo.outputs.golden_repo }}
+          GOLDEN_COMMIT: ${{ steps.repo.outputs.golden_commit }}
+        run: |
+          set -euo pipefail
+          if [ -d .cache/golden.git ]; then
+            git -C .cache/golden.git remote set-url origin "https://github.com/$GOLDEN_REPO.git"
+            git -C .cache/golden.git worktree prune
+            rm -rf .cache/golden.git/worktrees
+            # 本地已有固定提交时不再联网。
+            if ! git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
+              git -C .cache/golden.git fetch --prune --tags || true
+            fi
+          else
+            git clone --mirror "https://github.com/$GOLDEN_REPO.git" .cache/golden.git
+          fi
+          if git -C .cache/golden.git cat-file -e "$GOLDEN_COMMIT^{commit}" 2>/dev/null; then
+            echo "golden: $GOLDEN_REPO@$GOLDEN_COMMIT"
+            echo "golden_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "golden commit $GOLDEN_COMMIT not reachable; skipping save"
+            echo "golden_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save golden mirror
+        if: steps.golden-sync.outputs.golden_ready == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .cache/golden.git
+          key: golden-${{ steps.repo.outputs.golden_commit }}

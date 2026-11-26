@@ -185,9 +185,10 @@ jobs:
             api.cline.bot:443
       # 预编译包从 Releases 直拉：github.com 与 *.githubusercontent.com 已在白名单内，
       # 不需要 setup-uv 与 PyPI。缓存解压后的目录，key 固定为平台与版本。
+      # 只读恢复：缓存写入限定手动触发，其余事件由 ai-cache-warm.yml 保活。
       - name: Cache vibe-acp
         id: vibe-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: .tools/vibe-acp
           key: vibe-acp-linux-x86_64-3.1.4
@@ -212,6 +213,13 @@ jobs:
             *" 3.1.4") ;;
             *) echo "::error::vibe-acp 版本不是 3.1.4：$installed"; exit 1 ;;
           esac
+      # 冷启动只在手动触发时补齐缓存；issues / issue_comment 不写缓存。
+      - name: Save vibe-acp
+        if: github.event_name == 'workflow_dispatch' && steps.vibe-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .tools/vibe-acp
+          key: vibe-acp-linux-x86_64-3.1.4
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
@@ -297,15 +305,16 @@ jobs:
             fi
           fi
       # 只有主分支前进时才落一份新缓存；同一 SHA 重复保存既浪费又会报 save failed。
+      # 缓存写入同样限定手动触发，被动事件由 ai-cache-warm.yml 的定时保活维护。
       - name: Save GT6 mirror
-        if: always() && steps.sync-mirrors.outputs.gt6_changed == 'true'
+        if: always() && github.event_name == 'workflow_dispatch' && steps.sync-mirrors.outputs.gt6_changed == 'true'
         continue-on-error: true
         uses: actions/cache/save@v6
         with:
           path: .cache/gt6.git
           key: ${{ needs.gate.outputs.cache_prefix }}-${{ steps.sync-mirrors.outputs.gt6_sha }}
       - name: Save golden mirror
-        if: always() && steps.golden-cache.outputs.cache-hit != 'true'
+        if: always() && github.event_name == 'workflow_dispatch' && steps.golden-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v6
         with:
